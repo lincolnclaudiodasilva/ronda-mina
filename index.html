@@ -1418,7 +1418,7 @@ async function limparTudo(){
   }
 }
 
-function exportarCSV(){
+async function exportarCSV(){
   if (registros.length === 0) { mostrarToast('Nenhum registro para exportar.'); return; }
   const headers = ['id','data_analise','hora_analise','responsavel','area','codigo_atividade','atividade','origem_atividade','status_campo','prioridade','incluir_proximo_plano','observacoes','qtd_fotos','nomes_arquivos_fotos'];
   const linhas = [headers.join(';')];
@@ -1434,14 +1434,8 @@ function exportarCSV(){
   });
   const csv = '\uFEFF' + linhas.join('\n');
   const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
   const dataHoje = new Date().toISOString().slice(0,10);
-  a.href = url;
-  a.download = `ronda_mina_${dataHoje}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  await salvarOuAbrirArquivo(blob, `ronda_mina_${dataHoje}.csv`);
   mostrarToast('CSV exportado ✓ — use "Exportar fotos (.zip)" para baixar as imagens com os mesmos nomes de arquivo.');
 }
 
@@ -1504,14 +1498,8 @@ async function exportarFotosZip(){
 
   mostrarProgressoExportacao('Gerando arquivo final...', 100);
   const blobZip = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
-  const url = URL.createObjectURL(blobZip);
-  const a = document.createElement('a');
   const dataHoje = new Date().toISOString().slice(0,10);
-  a.href = url;
-  a.download = `fotos_ronda_mina_${dataHoje}.zip`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  await salvarOuAbrirArquivo(blobZip, `fotos_ronda_mina_${dataHoje}.zip`);
   limparProgressoExportacao();
   mostrarToast(`✓ ${totalFotos} foto(s) exportada(s) em .zip`);
 }
@@ -1542,12 +1530,34 @@ async function exportarRelatorioPdf(){
   const MARGEM = 40;
   const AZUL = rgb(0x0b/255, 0x25/255, 0x40/255);
   const CINZA = rgb(0.35, 0.38, 0.42);
+
+  // a fonte padrão do PDF (Helvetica/WinAnsi) não tem todos os caracteres Unicode —
+  // superscripts (³, ²), emojis, e até quebras de linha (\n) dentro de um texto que
+  // deveria ser uma única linha quebram o desenho com erro "WinAnsi cannot encode".
+  // Sanitiza qualquer texto vindo de campo livre antes de desenhar.
+  function sanitizarTextoPdf(texto){
+    if (texto === null || texto === undefined) return '';
+    return String(texto)
+      .replace(/\r\n|\r|\n/g, ' ')   // quebras de linha viram espaço (texto de uma linha só)
+      .replace(/\t/g, '  ')           // tabs viram espaços
+      .replace(/³/g, '3').replace(/²/g, '2').replace(/¹/g, '1')
+      .replace(/[\u{1F300}-\u{1FAFF}]|[\u{2600}-\u{27BF}]/gu, '') // remove emojis comuns
+      .replace(/[^\x00-\xFF]/g, '?'); // qualquer outro caractere fora do WinAnsi vira "?", em vez de quebrar
+  }
+
   const corStatus = {
     'Conforme': rgb(0.18,0.49,0.31),
     'Parcial / Em execução': rgb(0.79,0.50,0.05),
     'Não conforme': rgb(0.75,0.22,0.17),
     'Não verificado / Não acessado': rgb(0.36,0.39,0.44)
   };
+
+  // tamanhos de fonte ampliados para leitura confortável (estilo relatório formal)
+  const TAM_TITULO = 15;
+  const TAM_STATUS = 13;
+  const TAM_LABEL = 11.5;
+  const TAM_TEXTO = 11.5;
+  const TAM_SUBTITULO = 12;
 
   // --- capa ---
   let page = pdfDoc.addPage([LARGURA, ALTURA]);
@@ -1566,7 +1576,7 @@ async function exportarRelatorioPdf(){
     `Gerado em: ${new Date().toLocaleString('pt-BR')}`
   ];
   linhasCapa.forEach(linha => {
-    page.drawText(linha, { x: MARGEM, y: yCapa, size:11, font: fonteRegular, color: CINZA });
+    page.drawText(sanitizarTextoPdf(linha), { x: MARGEM, y: yCapa, size:11, font: fonteRegular, color: CINZA });
     yCapa -= 20;
   });
 
@@ -1582,107 +1592,215 @@ async function exportarRelatorioPdf(){
     yCapa -= 18;
   });
 
-  // --- uma página por registro ---
-  let processados = 0;
-  for (const r of registros) {
-    page = pdfDoc.addPage([LARGURA, ALTURA]);
-    let y = ALTURA - MARGEM;
+  // ============================================================
+  // Desenha UM registro dentro de uma região (x, yTopo, largura, alturaDisponivel).
+  // Devolve {coube: boolean, alturaUsada: number}. Se coube=false, o chamador deve
+  // descartar o que foi desenhado (usando uma página nova) e tentar de novo em
+  // área maior — por isso esta função primeiro testa em modo "simulação" quando
+  // pedido, sem desenhar nada, só para medir.
+  // ============================================================
+  function desenharRegistro(page, r, x, yTopo, largura, alturaDisponivel, apenasMedir, fotosParaUsar){
+    let y = yTopo;
+    const yLimite = yTopo - alturaDisponivel;
+    let estourou = false;
 
-    page.drawRectangle({ x:0, y: y-2, width: LARGURA, height:46, color: AZUL });
-    page.drawText(r.atividade.length > 70 ? r.atividade.slice(0,70)+'…' : r.atividade, { x: MARGEM, y: y-22, size:13, font: fonteNegrito, color: rgb(1,1,1), maxWidth: LARGURA-2*MARGEM });
-    y -= 60;
+    function escrever(texto, opts){
+      if (!apenasMedir) page.drawText(sanitizarTextoPdf(texto), opts);
+    }
+    function retangulo(opts){
+      if (!apenasMedir) page.drawRectangle(opts);
+    }
 
+    // cabeçalho colorido com a atividade
+    const alturaCabecalho = 34;
+    retangulo({ x: x-4, y: y - alturaCabecalho + 6, width: largura+8, height: alturaCabecalho, color: AZUL });
+    const tituloTexto = r.atividade.length > 78 ? r.atividade.slice(0,78)+'…' : r.atividade;
+    escrever(tituloTexto, { x: x, y: y - 18, size: TAM_TITULO-2, font: fonteNegrito, color: rgb(1,1,1), maxWidth: largura-8 });
+    y -= (alturaCabecalho + 14);
+    if (y < yLimite) estourou = true;
+
+    // badge de status
     const corBadge = corStatus[r.status_campo] || CINZA;
-    page.drawRectangle({ x: MARGEM, y: y-4, width: 14, height:14, color: corBadge });
-    page.drawText(r.status_campo, { x: MARGEM+20, y: y, size:11, font: fonteNegrito, color: corBadge });
-    y -= 26;
+    retangulo({ x: x, y: y-4, width: 16, height:16, color: corBadge });
+    escrever(r.status_campo, { x: x+22, y: y, size: TAM_STATUS, font: fonteNegrito, color: corBadge });
+    y -= 28;
+    if (y < yLimite) estourou = true;
 
+    // cartão de campos
     const camposInfo = [
       [`Data/hora`, `${r.data_analise.split('-').reverse().join('/')} ${r.hora_analise||''}`],
       [`Área`, r.area || '—'],
       [`Responsável`, r.responsavel],
       [`Código`, r.codigo_atividade],
+      [`Origem`, r.origem_atividade || '—'],
       [`Prioridade`, r.prioridade || '—'],
       [`Próximo plano`, r.incluir_proximo_plano]
     ];
+    const alturaLinhaCampo = 19;
+    const alturaCartaoInfo = camposInfo.length * alturaLinhaCampo + 14;
+    retangulo({ x: x-8, y: y - alturaCartaoInfo + 12, width: largura+16, height: alturaCartaoInfo, color: rgb(0.97,0.98,0.99), borderColor: rgb(0.88,0.90,0.93), borderWidth: 1 });
+    y -= 8;
+    const larguraLabel = 130;
     camposInfo.forEach(([label, valor]) => {
-      page.drawText(`${label}:`, { x: MARGEM, y, size:9.5, font: fonteNegrito, color: CINZA });
-      page.drawText(String(valor), { x: MARGEM+95, y, size:9.5, font: fonteRegular, color: rgb(0.1,0.1,0.1), maxWidth: LARGURA-2*MARGEM-95 });
-      y -= 16;
+      escrever(`${label}:`, { x: x, y, size: TAM_LABEL, font: fonteNegrito, color: CINZA });
+      escrever(String(valor), { x: x+larguraLabel, y, size: TAM_LABEL, font: fonteRegular, color: rgb(0.1,0.1,0.1), maxWidth: largura-larguraLabel });
+      y -= alturaLinhaCampo;
     });
+    y -= 10;
+    if (y < yLimite) estourou = true;
 
+    // observações (texto corrido, quebrado em linhas)
     if (r.observacoes) {
-      y -= 6;
-      page.drawText('Observações:', { x: MARGEM, y, size:9.5, font: fonteNegrito, color: CINZA });
-      y -= 14;
-      const palavras = r.observacoes.split(' ');
+      escrever('Observações:', { x, y, size: TAM_LABEL, font: fonteNegrito, color: CINZA });
+      y -= 16;
+      const textoObsLimpo = sanitizarTextoPdf(r.observacoes);
+      const palavras = textoObsLimpo.split(' ');
       let linhaAtual = '';
-      const larguraMax = LARGURA - 2*MARGEM;
       for (const palavra of palavras) {
         const teste = linhaAtual ? linhaAtual + ' ' + palavra : palavra;
-        if (fonteRegular.widthOfTextAtSize(teste, 9.5) > larguraMax) {
-          page.drawText(linhaAtual, { x: MARGEM, y, size:9.5, font: fonteRegular, color: rgb(0.1,0.1,0.1) });
-          y -= 13;
+        if (fonteRegular.widthOfTextAtSize(teste, TAM_TEXTO) > largura) {
+          escrever(linhaAtual, { x, y, size: TAM_TEXTO, font: fonteRegular, color: rgb(0.1,0.1,0.1) });
+          y -= 15;
+          if (y < yLimite) estourou = true;
           linhaAtual = palavra;
         } else {
           linhaAtual = teste;
         }
       }
-      if (linhaAtual) { page.drawText(linhaAtual, { x: MARGEM, y, size:9.5, font: fonteRegular, color: rgb(0.1,0.1,0.1) }); y -= 13; }
+      if (linhaAtual) { escrever(linhaAtual, { x, y, size: TAM_TEXTO, font: fonteRegular, color: rgb(0.1,0.1,0.1) }); y -= 15; }
+      y -= 6;
+      if (y < yLimite) estourou = true;
     }
 
-    y -= 14;
-    const idsFotos = r.foto_ids || [];
-    if (idsFotos.length > 0) {
-      page.drawText(`Registro fotográfico (${idsFotos.length})`, { x: MARGEM, y, size:10, font: fonteNegrito, color: AZUL });
-      y -= 10;
-
-      const colunas = 2;
-      const gap = 12;
-      const larguraFoto = (LARGURA - 2*MARGEM - gap) / colunas;
+    // fotos (1 coluna nesse layout de meia-página, para manter legibilidade)
+    if (fotosParaUsar && fotosParaUsar.length > 0) {
+      escrever(`Registro fotográfico (${fotosParaUsar.length})`, { x, y, size: TAM_SUBTITULO, font: fonteNegrito, color: AZUL });
+      y -= 12;
+      const larguraFoto = Math.min(largura * 0.55, 230);
       const alturaFoto = larguraFoto * 0.72;
-      let coluna = 0;
-      let xFoto = MARGEM;
-
-      for (const fotoId of idsFotos) {
-        const blob = await idbObterFoto(fotoId);
-        if (!blob) continue;
-        const bytes = await carregarBlobComoArrayBuffer(blob);
-        let imagemEmbed;
-        try { imagemEmbed = await pdfDoc.embedJpg(bytes); }
-        catch(e) { try { imagemEmbed = await pdfDoc.embedPng(bytes); } catch(e2) { continue; } }
-
-        if (y - alturaFoto < MARGEM) {
-          page = pdfDoc.addPage([LARGURA, ALTURA]);
-          y = ALTURA - MARGEM;
-          coluna = 0; xFoto = MARGEM;
+      let indiceParada = -1;
+      for (let idx = 0; idx < fotosParaUsar.length; idx++) {
+        if (y - alturaFoto < yLimite) { estourou = true; indiceParada = idx; break; }
+        if (!apenasMedir && fotosParaUsar[idx]) {
+          page.drawImage(fotosParaUsar[idx], { x, y: y - alturaFoto, width: larguraFoto, height: alturaFoto });
         }
-
-        page.drawImage(imagemEmbed, { x: xFoto, y: y - alturaFoto, width: larguraFoto, height: alturaFoto });
-
-        coluna++;
-        if (coluna >= colunas) {
-          coluna = 0; xFoto = MARGEM; y -= (alturaFoto + gap);
-        } else {
-          xFoto += larguraFoto + gap;
-        }
+        y -= (alturaFoto + 10);
+      }
+      if (indiceParada >= 0) {
+        return { estourou, yFinal: y, fotosRestantes: fotosParaUsar.slice(indiceParada) };
       }
     }
 
+    return { estourou, yFinal: y, fotosRestantes: [] };
+  }
+
+  // pré-carrega as imagens de todos os registros (embute uma vez, reaproveita)
+  async function carregarImagensDoRegistro(r){
+    const idsFotos = r.foto_ids || [];
+    const imagens = [];
+    for (const fotoId of idsFotos) {
+      const blob = await idbObterFoto(fotoId);
+      if (!blob) continue;
+      const bytes = await carregarBlobComoArrayBuffer(blob);
+      try { imagens.push(await pdfDoc.embedJpg(bytes)); }
+      catch(e) { try { imagens.push(await pdfDoc.embedPng(bytes)); } catch(e2) { /* ignora foto corrompida */ } }
+    }
+    return imagens;
+  }
+
+  // --- corpo: 2 registros por página (compactados, sem espaço fixo reservado), ou 1
+  //     registro usando a página inteira quando o conteúdo não couber nem assim ---
+  const ALTURA_UTIL = ALTURA - 2*MARGEM;
+  const LARGURA_UTIL = LARGURA - 2*MARGEM;
+  const ESPACO_ENTRE_REGISTROS = 22; // respiro entre o fim do 1º registro e o início do 2º na mesma página
+
+  let processados = 0;
+  let i = 0;
+  while (i < registros.length) {
+    const r = registros[i];
+    const imagens = await carregarImagensDoRegistro(r);
+    const yTopoPagina = ALTURA - MARGEM;
+    const yLimitePagina = MARGEM;
+
+    // mede (em página fantasma, descartada depois) onde o registro 1 terminaria
+    // se tivesse a página inteira disponível
+    const paginaFantasma = pdfDoc.addPage([LARGURA, ALTURA]);
+    const medida1 = desenharRegistro(paginaFantasma, r, MARGEM, yTopoPagina, LARGURA_UTIL, ALTURA_UTIL, true, imagens);
+    pdfDoc.removePage(pdfDoc.getPageCount() - 1);
+
+    if (medida1.estourou) {
+      // não cabe nem usando a página inteira sozinho — vai para o tratamento de "registro grande"
+      page = pdfDoc.addPage([LARGURA, ALTURA]);
+      let resultadoDesenho = desenharRegistro(page, r, MARGEM, yTopoPagina, LARGURA_UTIL, ALTURA_UTIL, false, imagens);
+
+      while (resultadoDesenho.fotosRestantes && resultadoDesenho.fotosRestantes.length > 0) {
+        const fotosQueFaltam = resultadoDesenho.fotosRestantes;
+        page = pdfDoc.addPage([LARGURA, ALTURA]);
+        let yCont = ALTURA - MARGEM;
+        page.drawText(`Registro fotográfico (continuação)`, { x: MARGEM, y: yCont, size: TAM_SUBTITULO, font: fonteNegrito, color: AZUL });
+        yCont -= 16;
+        const larguraFotoCont = Math.min(LARGURA_UTIL * 0.55, 230);
+        const alturaFotoCont = larguraFotoCont * 0.72;
+        let indiceParadaCont = -1;
+        for (let idx = 0; idx < fotosQueFaltam.length; idx++) {
+          if (yCont - alturaFotoCont < MARGEM) { indiceParadaCont = idx; break; }
+          if (fotosQueFaltam[idx]) {
+            page.drawImage(fotosQueFaltam[idx], { x: MARGEM, y: yCont - alturaFotoCont, width: larguraFotoCont, height: alturaFotoCont });
+          }
+          yCont -= (alturaFotoCont + 10);
+        }
+        resultadoDesenho = { fotosRestantes: indiceParadaCont >= 0 ? fotosQueFaltam.slice(indiceParadaCont) : [] };
+      }
+
+      processados++;
+      mostrarProgressoExportacao(`Montando relatório... (${processados}/${registros.length} registros)`, Math.round((processados/registros.length)*100));
+      i += 1;
+      continue;
+    }
+
+    // cabe na página: desenha de fato o registro 1, a partir do topo
+    page = pdfDoc.addPage([LARGURA, ALTURA]);
+    const resultado1 = desenharRegistro(page, r, MARGEM, yTopoPagina, LARGURA_UTIL, ALTURA_UTIL, false, imagens);
     processados++;
     mostrarProgressoExportacao(`Montando relatório... (${processados}/${registros.length} registros)`, Math.round((processados/registros.length)*100));
+
+    // tenta encaixar o PRÓXIMO registro logo abaixo, no espaço restante real da página
+    if (i+1 < registros.length) {
+      const r2 = registros[i+1];
+      const imagens2 = await carregarImagensDoRegistro(r2);
+      const yTopoSegundo = resultado1.yFinal - ESPACO_ENTRE_REGISTROS;
+      const alturaRestante = yTopoSegundo - yLimitePagina;
+
+      if (alturaRestante > 60) { // só tenta se ainda sobra um espaço minimamente útil
+        const testeSegundo = desenharRegistro(page, r2, MARGEM, yTopoSegundo, LARGURA_UTIL, alturaRestante, true, imagens2);
+
+        if (!testeSegundo.estourou) {
+          page.drawLine({ start: { x: MARGEM, y: yTopoSegundo + 8 }, end: { x: LARGURA-MARGEM, y: yTopoSegundo + 8 }, thickness: 1, color: rgb(0.75,0.78,0.82) });
+          desenharRegistro(page, r2, MARGEM, yTopoSegundo, LARGURA_UTIL, alturaRestante, false, imagens2);
+          processados++;
+          mostrarProgressoExportacao(`Montando relatório... (${processados}/${registros.length} registros)`, Math.round((processados/registros.length)*100));
+          i += 2;
+          continue;
+        }
+      }
+      // não coube no espaço restante desta página: r2 fica para a próxima página
+      i += 1;
+      continue;
+    }
+    i += 1;
   }
 
   const pdfBytes = await pdfDoc.save();
   const blobPdf = new Blob([pdfBytes], { type: 'application/pdf' });
-  const url = URL.createObjectURL(blobPdf);
   const dataHoje = new Date().toISOString().slice(0,10);
   const nomeArquivo = `relatorio_ronda_mina_${dataHoje}.pdf`;
 
   limparProgressoExportacao();
 
   // tenta abrir o menu de compartilhar nativo (permite enviar direto por e-mail/whatsapp);
-  // se o navegador não suportar Web Share com arquivos, cai no download normal.
+  // se o navegador não suportar Web Share com arquivos, ou se falhar (ex: user activation
+  // expirada após o processamento longo do PDF), cai no fallback robusto que já trata
+  // corretamente o caso de PWA standalone no iOS.
   const arquivoPdf = new File([blobPdf], nomeArquivo, { type: 'application/pdf' });
   if (navigator.canShare && navigator.canShare({ files: [arquivoPdf] })) {
     try {
@@ -1693,15 +1811,10 @@ async function exportarRelatorioPdf(){
       });
       mostrarToast('✓ Relatório PDF pronto para compartilhar');
       return;
-    } catch (e) { /* usuário cancelou o compartilhamento ou falhou; cai no download */ }
+    } catch (e) { /* usuário cancelou o compartilhamento ou falhou; cai no fallback abaixo */ }
   }
 
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = nomeArquivo;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  await salvarOuAbrirArquivo(blobPdf, nomeArquivo);
   mostrarToast('✓ Relatório PDF gerado — anexe-o no seu app de e-mail');
 }
 
@@ -1721,6 +1834,59 @@ function mostrarToastErro(msg){
     t.classList.remove('show');
     t.style.background = '';
   }, 6000); // erros ficam visíveis por mais tempo, para dar tempo de ler/fotografar a mensagem
+}
+
+// ============================================================
+// SALVAR/BAIXAR ARQUIVO — com tratamento especial para PWA instalado em modo
+// standalone no iOS, onde o link <a download> simplesmente não funciona (bug
+// conhecido e documentado do WebKit). Nesse caso, abrimos o arquivo numa nova
+// aba via Data URL, e o próprio iOS oferece "Salvar em Arquivos"/Compartilhar
+// a partir dessa visualização.
+// ============================================================
+function salvarOuAbrirArquivo(blob, nomeArquivo){
+  const iosStandalone = isIOS() && isStandalone();
+
+  if (!iosStandalone) {
+    // caminho normal: funciona em Android, desktop, e Safari fora do modo instalado
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = nomeArquivo;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    return Promise.resolve();
+  }
+
+  // iOS standalone: converte para Data URL e abre em nova aba/popup.
+  // Precisa ser uma conversão via FileReader (não URL.createObjectURL) porque
+  // blob: URLs também têm suporte instável nesse mesmo contexto do iOS.
+  // Devolve uma Promise para que o chamador possa "esperar" essa etapa terminar
+  // antes de seguir (ex: mostrar o toast de sucesso só depois de abrir a janela).
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const novaJanela = window.open();
+      if (!novaJanela) {
+        mostrarToastErro('Não foi possível abrir o arquivo. Permita pop-ups para este site e tente novamente.');
+        resolve();
+        return;
+      }
+      novaJanela.document.write(`
+        <html><head><title>${nomeArquivo}</title></head>
+        <body style="margin:0;display:flex;flex-direction:column;height:100vh;font-family:-apple-system,sans-serif;">
+          <div style="padding:14px 16px;background:#0b2540;color:#fff;font-size:14px;">
+            📄 ${nomeArquivo} — toque e segure o documento, ou use o botão de compartilhar do Safari para salvar.
+          </div>
+          <iframe src="${reader.result}" style="flex:1;border:none;width:100%;"></iframe>
+        </body></html>
+      `);
+      resolve();
+    };
+    reader.onerror = () => { mostrarToastErro('Não foi possível preparar o arquivo para abrir.'); resolve(); };
+    reader.readAsDataURL(blob);
+  });
 }
 
 // ============================================================
@@ -1868,7 +2034,7 @@ function restaurarListaPadrao(){
   mostrarToast('Lista padrão restaurada.');
 }
 
-function exportarCsvAtividadesAtuais(){
+async function exportarCsvAtividadesAtuais(){
   const headers = ['area','codigo','atividade','frota','status_plano','prioridade'];
   const linhas = [headers.join(';')];
   atividadesAtuais.forEach(a => {
@@ -1876,13 +2042,7 @@ function exportarCsvAtividadesAtuais(){
   });
   const csv = '\uFEFF' + linhas.join('\n');
   const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'atividades_plano_atual.csv';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  await salvarOuAbrirArquivo(blob, 'atividades_plano_atual.csv');
   mostrarToast('CSV de atividades exportado ✓');
 }
 

@@ -1,7 +1,7 @@
 // Service Worker — Ronda de Mina
 // Cacheia o app shell para permitir uso offline em campo (mina, sem sinal).
 
-const CACHE_NAME = 'ronda-mina-v5';
+const CACHE_NAME = 'ronda-mina-v7';
 const ARQUIVOS_CACHE_LOCAIS = [
   './index.html',
   './manifest.json',
