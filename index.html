@@ -1672,17 +1672,26 @@ async function exportarRelatorioPdf(){
       if (y < yLimite) estourou = true;
     }
 
-    // fotos (1 coluna nesse layout de meia-página, para manter legibilidade)
+    // fotos (2 colunas lado a lado, para aproveitar melhor a largura da página)
     if (fotosParaUsar && fotosParaUsar.length > 0) {
       escrever(`Registro fotográfico (${fotosParaUsar.length})`, { x, y, size: TAM_SUBTITULO, font: fonteNegrito, color: AZUL });
       y -= 12;
-      const larguraFoto = Math.min(largura * 0.55, 230);
+      const NUM_COLUNAS_FOTO = 2;
+      const ESPACO_COL_FOTO = 10;
+      const larguraFoto = (largura - ESPACO_COL_FOTO * (NUM_COLUNAS_FOTO - 1)) / NUM_COLUNAS_FOTO;
       const alturaFoto = larguraFoto * 0.72;
       let indiceParada = -1;
-      for (let idx = 0; idx < fotosParaUsar.length; idx++) {
+      for (let idx = 0; idx < fotosParaUsar.length; idx += NUM_COLUNAS_FOTO) {
         if (y - alturaFoto < yLimite) { estourou = true; indiceParada = idx; break; }
-        if (!apenasMedir && fotosParaUsar[idx]) {
-          page.drawImage(fotosParaUsar[idx], { x, y: y - alturaFoto, width: larguraFoto, height: alturaFoto });
+        if (!apenasMedir) {
+          for (let col = 0; col < NUM_COLUNAS_FOTO; col++) {
+            const fi = idx + col;
+            if (fi >= fotosParaUsar.length) break;
+            if (fotosParaUsar[fi]) {
+              const xFoto = x + col * (larguraFoto + ESPACO_COL_FOTO);
+              page.drawImage(fotosParaUsar[fi], { x: xFoto, y: y - alturaFoto, width: larguraFoto, height: alturaFoto });
+            }
+          }
         }
         y -= (alturaFoto + 10);
       }
@@ -1739,13 +1748,20 @@ async function exportarRelatorioPdf(){
         let yCont = ALTURA - MARGEM;
         page.drawText(`Registro fotográfico (continuação)`, { x: MARGEM, y: yCont, size: TAM_SUBTITULO, font: fonteNegrito, color: AZUL });
         yCont -= 16;
-        const larguraFotoCont = Math.min(LARGURA_UTIL * 0.55, 230);
+        const NUM_COLUNAS_FOTO_CONT = 2;
+        const ESPACO_COL_FOTO_CONT = 10;
+        const larguraFotoCont = (LARGURA_UTIL - ESPACO_COL_FOTO_CONT * (NUM_COLUNAS_FOTO_CONT - 1)) / NUM_COLUNAS_FOTO_CONT;
         const alturaFotoCont = larguraFotoCont * 0.72;
         let indiceParadaCont = -1;
-        for (let idx = 0; idx < fotosQueFaltam.length; idx++) {
+        for (let idx = 0; idx < fotosQueFaltam.length; idx += NUM_COLUNAS_FOTO_CONT) {
           if (yCont - alturaFotoCont < MARGEM) { indiceParadaCont = idx; break; }
-          if (fotosQueFaltam[idx]) {
-            page.drawImage(fotosQueFaltam[idx], { x: MARGEM, y: yCont - alturaFotoCont, width: larguraFotoCont, height: alturaFotoCont });
+          for (let col = 0; col < NUM_COLUNAS_FOTO_CONT; col++) {
+            const fi = idx + col;
+            if (fi >= fotosQueFaltam.length) break;
+            if (fotosQueFaltam[fi]) {
+              const xFotoCont = MARGEM + col * (larguraFotoCont + ESPACO_COL_FOTO_CONT);
+              page.drawImage(fotosQueFaltam[fi], { x: xFotoCont, y: yCont - alturaFotoCont, width: larguraFotoCont, height: alturaFotoCont });
+            }
           }
           yCont -= (alturaFotoCont + 10);
         }
